@@ -724,6 +724,114 @@ async def agent_json(req):
     })
 
 
+# ── AI Brief ─────────────────────────────────────────────────────────────────
+HIVEAI_URL = "https://hive-ai-1.onrender.com/v1/chat/completions"
+HIVEAI_KEY = HIVE_KEY
+HIVEAI_MODEL = "meta-llama/llama-3.1-8b-instruct"
+
+
+async def _call_hive_ai(system_prompt: str, user_prompt: str) -> Optional[str]:
+    """Call HiveAI with graceful fallback — never raises."""
+    try:
+        async with aiohttp.ClientSession() as s:
+            async with s.post(
+                HIVEAI_URL,
+                headers={
+                    "Content-Type": "application/json",
+                    "Authorization": f"Bearer {HIVEAI_KEY}",
+                },
+                json={
+                    "model": HIVEAI_MODEL,
+                    "max_tokens": 200,
+                    "messages": [
+                        {"role": "system", "content": system_prompt},
+                        {"role": "user",   "content": user_prompt},
+                    ],
+                },
+                timeout=aiohttp.ClientTimeout(total=30),
+            ) as r:
+                data = await r.json()
+                return data["choices"][0]["message"]["content"]
+    except Exception:
+        return None
+
+
+async def locus_ai_brief(req):
+    """
+    POST /locus/ai/brief  ($0.03/call)
+    Body: { entity, context }
+    1. POST /locus/locate/agent to get (X, Y, Z) coordinate
+    2. Call HiveAI to interpret the position
+    Response: { success, coordinate: {x,y,z}, brief, price_usdc: 0.03 }
+    """
+    try:
+        body    = await req.json()
+    except Exception:
+        return web.json_response({"error": "Invalid JSON body"}, status=400)
+
+    entity  = body.get("entity", "")
+    context = body.get("context", "")
+
+    if not entity:
+        return web.json_response({"error": "entity required"}, status=400)
+
+    # Step 1: locate the agent to get coordinate
+    coordinate = {"x": 0.5, "y": 0.5, "z": 0.5}  # default
+    try:
+        port = int(os.environ.get("PORT", 8768))
+        async with aiohttp.ClientSession() as s:
+            async with s.post(
+                f"http://localhost:{port}/locus/locate/agent",
+                json={"did": entity, "context": context},
+                timeout=aiohttp.ClientTimeout(total=30),
+            ) as r:
+                if r.status == 200:
+                    result = await r.json()
+                    coord  = result.get("coordinate", {})
+                    if coord:
+                        coordinate = {
+                            "x": round(float(coord.get("x", 0.5)), 3),
+                            "y": round(float(coord.get("y", 0.5)), 3),
+                            "z": round(float(coord.get("z", 0.5)), 3),
+                        }
+    except Exception:
+        pass  # use default coordinate
+
+    # Step 2: AI interpretation
+    system_prompt = (
+        "You are HiveLocus — the 9-head coordinate engine. "
+        "Interpret this agent's position in the network. "
+        "X=trust (0-1), Y=velocity (0-1), Z=depth (0-1). "
+        "What does this position mean? What should the agent do next? 3 sentences."
+    )
+    user_prompt = (
+        f"Entity: {entity}\n"
+        f"Context: {context}\n"
+        f"Coordinate: X={coordinate['x']} (trust), Y={coordinate['y']} (velocity), Z={coordinate['z']} (depth)\n\n"
+        "Interpret this coordinate and advise the agent."
+    )
+
+    brief = await _call_hive_ai(system_prompt, user_prompt)
+    if not brief:
+        x, y, z = coordinate["x"], coordinate["y"], coordinate["z"]
+        trust_word = "high" if x > 0.66 else "moderate" if x > 0.33 else "low"
+        vel_word   = "fast" if y > 0.66 else "moderate" if y > 0.33 else "slow"
+        depth_word = "deep" if z > 0.66 else "mid-shell" if z > 0.33 else "outer-shell"
+        brief = (
+            f"This agent occupies a {trust_word}-trust, {vel_word}-velocity, {depth_word} position in the Hive network. "
+            f"The coordinate ({x}, {y}, {z}) indicates {'strong network integration' if x > 0.5 else 'emerging network presence'} "
+            f"with {'accelerating' if y > 0.5 else 'building'} momentum. "
+            f"Recommended next action: {'engage high-value tasks to consolidate position' if x > 0.5 else 'build trust through consistent task delivery before attempting deeper network penetration'}."
+        )
+
+    return web.json_response({
+        "success":    True,
+        "coordinate": coordinate,
+        "brief":      brief,
+        "price_usdc": 0.03,
+    })
+
+
 # ── App ───────────────────────────────────────────────────────────────────────
 async def on_startup(app):
     asyncio.create_task(boot())
@@ -739,6 +847,7 @@ async def run():
     app.router.add_post("/locus/locate/agent",      locate_agent_route)
     app.router.add_post("/locus/locate/sensor",     locate_sensor_route)
     app.router.add_post("/locus/locate/market",     locate_market_route)
+    app.router.add_post("/locus/ai/brief",          locus_ai_brief)
     app.router.add_get("/llms.txt",                 llms_txt)
     app.router.add_get("/.well-known/agent.json",   agent_json)
 

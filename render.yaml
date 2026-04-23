@@ -1,0 +1,11 @@
+services:
+  - type: web
+    name: hive-locus
+    env: python
+    buildCommand: pip install -r requirements.txt
+    startCommand: python locus_agent.py
+    envVars:
+      - key: PORT
+        value: 8768
+      - key: HIVE_KEY
+        value: hive_internal_125e04e071e8829be631ea0216dd4a0c9b707975fcecaf8c62c6a2ab43327d46

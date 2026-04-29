@@ -982,6 +982,7 @@ async def run():
 
     app.router.add_get("/health",                   health)
     app.router.add_get("/v1/locus/sample",          locus_sample)
+    app.router.add_get("/locate/sample",             locus_sample)   # Rail 2 catnip alias
     app.router.add_get("/locus/status",             status_route)
     app.router.add_post("/locus/locate",            locate_route)
     app.router.add_post("/locus/locate/agent",      locate_agent_route)

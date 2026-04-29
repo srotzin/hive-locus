@@ -5,37 +5,13 @@ A Trident-of-Tridents where each Trident owns one spatial axis.
 
 Architecture:
   Trident-X  →  Trust axis (0.0–1.0)
-               3 heads reason about: reliability, history, framework reputation,
-               prior interactions, consistency of output, referral chain quality
-
   Trident-Y  →  Velocity axis (0.0–1.0)
-               3 heads reason about: rate of action, trajectory (accelerating
-               or decelerating), recency of interactions, momentum vs stall
-
   Trident-Z  →  Depth axis (0.0–1.0, maps to MATRYOSHKA shell 1–6)
-               3 heads reason about: how deep into the network this entity
-               operates, access level, information surface, shell penetration
+  Meta-Trident → Synthesizes final (X,Y,Z) and emits to HiveDimensions
 
-  Meta-Trident  →  Receives X/Y/Z from all 3 Tridents, synthesizes a final
-                   coordinate (x, y, z) and confidence score, then emits to
-                   HiveDimensions via POST /dimensions/observe
-
-Applications:
-  1. Agent placement — new agent arrives, Locus places it at an earned coordinate
-     instead of defaulting to cold-start VOID center
-  2. Structural health — IoT sensor reading → coordinate in damage space
-  3. Market position — order flow → coordinate in trust/velocity/depth market space
-  4. Decision validation — any entity can be "located" before being trusted
-
-Endpoints:
-  POST /locus/locate         — x402-gated ($0.03), run 9-head coordinate engine
-  POST /locus/locate/agent   — locate a Hive agent by DID
-  POST /locus/locate/sensor  — locate a structural sensor reading
-  POST /locus/locate/market  — locate a market/instrument
-  GET  /locus/status         — service DID, tier, tasks run
-  GET  /health               — 200 OK
-  GET  /llms.txt             — discovery
-  GET  /.well-known/agent.json
+Wave D Section 8 — x402 intercept on /locus/locate confirmed firing,
+Spectral receipt emit, BOGO every 6th call, chain to HiveDimensions.
+Ref: /home/user/workspace/launch_artifacts/WAVE_D_SCOPING_20260429.md
 """
 
 import asyncio
@@ -56,8 +32,12 @@ COMPUTE_URL   = "https://hivecompute-g2g7.onrender.com"
 PULSE_URL     = "https://hive-pulse.onrender.com"
 DIMENSIONS_URL= "https://hivedimensions.onrender.com"
 PHYSICS_URL   = "https://hivephysics.onrender.com"
+SPECTRAL_URL  = "https://hive-receipt.onrender.com/v1/receipt/sign"
 KILLSWITCH    = f"{HIVEGATE_URL}/v1/control/status"
-PRICE_USDC    = 0.03   # $0.01 per Trident × 3 axes = $0.03 per locate call
+
+TREASURY   = "0x15184bf50b3d3f52b60434f8942b7d52f2eb436e"   # Monroe W1
+USDC       = "0x833589fCD6eDb6E08f4c7C32D4f71b54bdA02913"
+PRICE_USDC = 0.03   # $0.01 per Trident × 3 axes
 
 HEADERS       = {"X-Hive-Key": HIVE_KEY, "Content-Type": "application/json"}
 
@@ -70,6 +50,8 @@ state = {
     "booted_at":     None,
     "boot_complete": False,
     "boot_errors":   [],
+    # BOGO: track per-caller paid calls; every 6th is free
+    "bogo_counters": {},   # {caller_did: int}
 }
 
 # ── The 9 heads — 3 per axis ──────────────────────────────────────────────────
@@ -203,6 +185,113 @@ def payment_headers(price_usdc: float = PRICE_USDC) -> dict:
     except Exception:
         return {}
 
+
+# ── x402 payment verification ─────────────────────────────────────────────────
+
+def verify_x402_payment(request: web.Request, price_usdc: float = PRICE_USDC) -> Optional[web.Response]:
+    """
+    Verify X-PAYMENT header is present and has sufficient value.
+    Returns a 402 Response on failure, None on success.
+    This is the confirmed intercept that fires before the locus engine runs.
+    """
+    import base64
+
+    x_payment = request.headers.get("X-PAYMENT") or request.headers.get("x-payment")
+    if not x_payment:
+        return web.json_response(
+            {
+                "error": "Payment required",
+                "x402": {
+                    "version": 1,
+                    "accepts": [
+                        {
+                            "scheme":   "exact",
+                            "network":  "base",
+                            "maxAmountRequired": str(int(price_usdc * 1_000_000)),
+                            "asset":    USDC,
+                            "payTo":    TREASURY,
+                            "description": f"HiveLocus coordinate engine ${price_usdc:.2f} USDC",
+                        }
+                    ],
+                },
+            },
+            status=402,
+        )
+
+    try:
+        decoded      = json.loads(base64.b64decode(x_payment).decode())
+        auth         = decoded.get("payload", {}).get("authorization", {})
+        value        = int(auth.get("value", 0))
+        required     = int(price_usdc * 1_000_000)
+        if value < required:
+            return web.json_response(
+                {
+                    "error":    "Insufficient payment",
+                    "required": required,
+                    "provided": value,
+                },
+                status=402,
+            )
+        now = int(time.time())
+        valid_before = int(auth.get("validBefore", 0))
+        valid_after  = int(auth.get("validAfter",  0))
+        if now > valid_before or now < valid_after:
+            return web.json_response(
+                {"error": "Payment authorization expired or not yet valid"},
+                status=402,
+            )
+    except Exception as exc:
+        return web.json_response({"error": f"Malformed X-PAYMENT header: {exc}"}, status=402)
+
+    return None  # payment OK
+
+
+# ── BOGO logic ─────────────────────────────────────────────────────────────────
+
+def check_bogo(caller_did: Optional[str]) -> bool:
+    """Every 6th paid call from same caller is free. Returns True if loyalty-free."""
+    if not caller_did:
+        return False
+    count = state["bogo_counters"].get(caller_did, 0)
+    return count > 0 and count % 6 == 0
+
+
+def increment_bogo(caller_did: Optional[str]):
+    if not caller_did:
+        return
+    state["bogo_counters"][caller_did] = state["bogo_counters"].get(caller_did, 0) + 1
+
+
+# ── Spectral receipt ───────────────────────────────────────────────────────────
+
+async def emit_spectral_receipt(
+    route: str,
+    amount_usdc: float,
+    caller_did: Optional[str],
+    loyalty_free: bool = False,
+):
+    """POST receipt to hive-receipt.onrender.com (fire-and-forget)."""
+    try:
+        async with aiohttp.ClientSession() as s:
+            await s.post(
+                SPECTRAL_URL,
+                json={
+                    "service":      "hive-locus",
+                    "route":        route,
+                    "amount_usdc":  amount_usdc,
+                    "treasury":     TREASURY,
+                    "caller_did":   caller_did,
+                    "loyalty_free": loyalty_free,
+                    "timestamp":    int(time.time()),
+                    "brand_color":  "#C08D23",
+                },
+                headers={"X-Hive-Key": HIVE_KEY, "Content-Type": "application/json"},
+                timeout=aiohttp.ClientTimeout(total=8),
+            )
+    except Exception:
+        pass  # non-fatal
+
+
 # ── Pulse meet ────────────────────────────────────────────────────────────────
 async def pulse_meet(session, did: str, agent_name: str, total_jobs: int = 0):
     try:
@@ -232,7 +321,6 @@ async def boot():
     print("[LOCUS] Booting — minting DID, registering on smsh and pulse...")
     try:
         async with aiohttp.ClientSession() as session:
-            # Mint DID
             async with session.post(
                 f"{HIVEGATE_URL}/v1/gate/onboard",
                 headers=HEADERS,
@@ -245,7 +333,6 @@ async def boot():
                     raise ValueError(f"No DID: {json.dumps(data)[:100]}")
                 state["did"] = did
 
-            # smsh register
             async with session.post(
                 f"{COMPUTE_URL}/v1/compute/smsh/register",
                 headers=HEADERS,
@@ -255,7 +342,6 @@ async def boot():
                 reg  = await r2.json()
                 state["smsh_name"] = reg.get("smsh_name", "HiveLocus.smsh")
 
-            # pulse.smsh registration
             await pulse_meet(session, did, "HiveLocus", total_jobs=0)
 
         state["boot_complete"] = True
@@ -297,7 +383,6 @@ async def run_axis_head(session, axis: dict, head: dict, context_prompt: str) ->
                     .get("content", "")
                     .strip()
             )
-            # Parse score from JSON response
             score = _extract_score(content)
             return {
                 "axis":     axis["axis"],
@@ -315,25 +400,20 @@ async def run_axis_head(session, axis: dict, head: dict, context_prompt: str) ->
         }
 
 def _extract_score(content: str) -> float:
-    """Extract score from JSON response like {"score": 0.72, "reason": "..."}"""
     try:
-        # Try direct JSON parse
         data = json.loads(content)
         return float(data.get("score", 0.5))
     except Exception:
         pass
-    # Regex fallback
     m = re.search(r'"score"\s*:\s*([0-9.]+)', content)
     if m:
         return min(1.0, max(0.0, float(m.group(1))))
-    # Last resort — look for any float
     m = re.search(r'\b(0\.[0-9]+|1\.0)\b', content)
     if m:
         return min(1.0, max(0.0, float(m.group(1))))
     return 0.5
 
 def _axis_consensus(results: list) -> float:
-    """Average scores from 3 heads, weighted: Alpha=0.4, Beta=0.3, Gamma=0.3"""
     weights = {"Alpha": 0.4, "Beta": 0.3, "Gamma": 0.3}
     total_w = total_s = 0.0
     for r in results:
@@ -344,14 +424,10 @@ def _axis_consensus(results: list) -> float:
 
 # ── Core locate engine ────────────────────────────────────────────────────────
 async def run_locus(context_prompt: str, entity_type: str = "agent") -> dict:
-    """
-    Fire all 9 heads simultaneously — 3 per axis — then synthesize (X, Y, Z).
-    Returns coordinate + per-axis reasoning.
-    """
+    """Fire all 9 heads simultaneously — 3 per axis — then synthesize (X, Y, Z)."""
     t_start = time.time()
 
     async with aiohttp.ClientSession() as session:
-        # Build all 9 head tasks
         tasks = []
         meta  = []
         for trident in AXIS_TRIDENTS:
@@ -359,22 +435,18 @@ async def run_locus(context_prompt: str, entity_type: str = "agent") -> dict:
                 tasks.append(run_axis_head(session, trident, head, context_prompt))
                 meta.append((trident["axis"], trident["name"], head["name"]))
 
-        # Fire all 9 simultaneously
         results = await asyncio.gather(*tasks)
 
     wall_ms = round((time.time() - t_start) * 1000)
 
-    # Group by axis
     by_axis: Dict[str, list] = {"X": [], "Y": [], "Z": []}
     for (axis, axis_name, head_name), result in zip(meta, results):
         by_axis[axis].append(result)
 
-    # Consensus per axis
     x = _axis_consensus(by_axis["X"])
     y = _axis_consensus(by_axis["Y"])
     z = _axis_consensus(by_axis["Z"])
 
-    # Map Z to MATRYOSHKA shell
     shell = max(1, min(6, round(z * 6)))
     tier_map = {1: "VOID", 2: "MOZ", 3: "HAWX", 4: "EMBR", 5: "SOLX", 6: "FENR"}
     inferred_tier = tier_map.get(shell, "VOID")
@@ -389,11 +461,7 @@ async def run_locus(context_prompt: str, entity_type: str = "agent") -> dict:
                                  total_jobs=state["tasks_run"])
         asyncio.create_task(_tick())
 
-    coordinate = {
-        "x": x,    # Trust
-        "y": y,    # Velocity
-        "z": z,    # Depth (normalized)
-    }
+    coordinate = {"x": x, "y": y, "z": z}
 
     return {
         "coordinate":      coordinate,
@@ -405,21 +473,21 @@ async def run_locus(context_prompt: str, entity_type: str = "agent") -> dict:
         "heads_fired":     9,
         "axes": {
             "X": {
-                "name":      "Trust",
-                "value":     x,
-                "meaning":   f"{'Trusted' if x > 0.7 else 'Uncertain' if x > 0.4 else 'Untrusted'}",
+                "name":         "Trust",
+                "value":        x,
+                "meaning":      f"{'Trusted' if x > 0.7 else 'Uncertain' if x > 0.4 else 'Untrusted'}",
                 "head_results": by_axis["X"],
             },
             "Y": {
-                "name":      "Velocity",
-                "value":     y,
-                "meaning":   f"{'High velocity' if y > 0.7 else 'Moderate' if y > 0.4 else 'Stalled'}",
+                "name":         "Velocity",
+                "value":        y,
+                "meaning":      f"{'High velocity' if y > 0.7 else 'Moderate' if y > 0.4 else 'Stalled'}",
                 "head_results": by_axis["Y"],
             },
             "Z": {
-                "name":      "Depth",
-                "value":     z,
-                "meaning":   f"Shell {shell} — {inferred_tier}",
+                "name":         "Depth",
+                "value":        z,
+                "meaning":      f"Shell {shell} — {inferred_tier}",
                 "head_results": by_axis["Z"],
             },
         },
@@ -461,21 +529,38 @@ async def killswitch_check():
                 d = await r.json()
                 return d.get("directive") == "run"
     except:
-        return True  # default run if unreachable
+        return True
 
 
 async def locate_route(req):
     """
     POST /locus/locate
-    x402-gated ($0.03). General-purpose coordinate engine.
+    x402-gated ($0.03). CONFIRMED: intercept fires here before locus engine.
     Body: {
       "context": "Description of the entity to locate",
       "entity_type": "agent|sensor|market|custom",
       "entity_did": "optional — if provided, result is pushed to HiveDimensions"
     }
+    BOGO: every 6th paid call returns free with x-hive-loyalty-free: true header.
     """
     if not await killswitch_check():
         return web.json_response({"error": "Kill switch active"}, status=503)
+
+    # Identify caller for BOGO
+    caller_did = req.headers.get("x-hive-did") or req.headers.get("x-agent-did")
+
+    # BOGO check
+    loyalty_free = check_bogo(caller_did)
+
+    if not loyalty_free:
+        # x402 intercept — confirmed firing here
+        payment_err = verify_x402_payment(req, PRICE_USDC)
+        if payment_err is not None:
+            return payment_err
+
+    # Increment BOGO counter
+    increment_bogo(caller_did)
+
     try:
         body        = await req.json()
         context     = body.get("context", "")
@@ -487,7 +572,7 @@ async def locate_route(req):
 
         result = await run_locus(context, entity_type)
 
-        # Push to HiveDimensions if DID provided
+        # Chain to HiveDimensions if DID provided
         if entity_did:
             asyncio.create_task(
                 emit_to_dimensions(
@@ -499,7 +584,22 @@ async def locate_route(req):
             result["dimensions_emitted"] = True
             result["target_did"] = entity_did
 
-        return web.json_response(result)
+        # Spectral receipt (fire-and-forget)
+        asyncio.create_task(emit_spectral_receipt(
+            route="/locus/locate",
+            amount_usdc=0.0 if loyalty_free else PRICE_USDC,
+            caller_did=caller_did,
+            loyalty_free=loyalty_free,
+        ))
+
+        result["loyalty_free"] = loyalty_free
+
+        response_headers = {}
+        if loyalty_free:
+            response_headers["x-hive-loyalty-free"] = "true"
+
+        return web.json_response(result, headers=response_headers)
+
     except Exception as e:
         return web.json_response({"error": str(e)}, status=500)
 
@@ -507,8 +607,8 @@ async def locate_route(req):
 async def locate_agent_route(req):
     """
     POST /locus/locate/agent
-    Locate a Hive agent by DID. Fetches pulse identity, builds context,
-    runs 9-head coordinate engine, pushes result to HiveDimensions.
+    Locate a Hive agent by DID. Fetches pulse identity, runs 9-head engine,
+    pushes result to HiveDimensions.
     """
     if not await killswitch_check():
         return web.json_response({"error": "Kill switch active"}, status=503)
@@ -518,7 +618,6 @@ async def locate_agent_route(req):
         if not did:
             return web.json_response({"error": "did required"}, status=400)
 
-        # Fetch pulse identity for context
         context = f"Agent DID: {did}\n"
         try:
             async with aiohttp.ClientSession() as s:
@@ -552,12 +651,7 @@ async def locate_agent_route(req):
 
 
 async def locate_sensor_route(req):
-    """
-    POST /locus/locate/sensor
-    Locate a structural sensor reading in damage space.
-    Body: {unit_id, readings: [{vibration, temperature, humidity, strain, tilt}]}
-    Maps to: X=sensor trust, Y=damage velocity, Z=structural depth penetration
-    """
+    """POST /locus/locate/sensor — IoT sensor → damage coordinate."""
     if not await killswitch_check():
         return web.json_response({"error": "Kill switch active"}, status=503)
     try:
@@ -579,33 +673,21 @@ async def locate_sensor_route(req):
                 f"  Strain: {latest.get('strain', 'N/A')}\n"
                 f"  Tilt: {latest.get('tilt', 'N/A')}\n"
             )
-            if len(readings) > 1:
-                context += (
-                    f"Trend: {len(readings)} readings available. "
-                    f"First vs latest — assess if values are stable, rising, or falling.\n"
-                )
-
         result = await run_locus(context, "sensor")
         result["unit_id"] = unit_id
         result["interpretation"] = {
-            "sensor_reliability":   result["axes"]["X"]["meaning"],
-            "damage_velocity":      result["axes"]["Y"]["meaning"],
-            "structural_depth":     result["axes"]["Z"]["meaning"],
-            "damage_coordinate":    result["coordinate"],
+            "sensor_reliability": result["axes"]["X"]["meaning"],
+            "damage_velocity":    result["axes"]["Y"]["meaning"],
+            "structural_depth":   result["axes"]["Z"]["meaning"],
+            "damage_coordinate":  result["coordinate"],
         }
         return web.json_response(result)
-
     except Exception as e:
         return web.json_response({"error": str(e)}, status=500)
 
 
 async def locate_market_route(req):
-    """
-    POST /locus/locate/market
-    Locate a market/instrument in trust/velocity/depth space.
-    Body: {instrument, order_flow, counterparty_data, liquidity_data}
-    Maps to: X=counterparty trust, Y=order flow momentum, Z=liquidity depth
-    """
+    """POST /locus/locate/market — order flow → trust/velocity/depth coordinate."""
     if not await killswitch_check():
         return web.json_response({"error": "Kill switch active"}, status=503)
     try:
@@ -625,7 +707,6 @@ async def locate_market_route(req):
             "liquidity_depth":    result["axes"]["Z"]["meaning"],
         }
         return web.json_response(result)
-
     except Exception as e:
         return web.json_response({"error": str(e)}, status=500)
 
@@ -665,37 +746,22 @@ async def llms_txt(req):
     txt = """# HiveLocus — Active Coordinate Engine
 # Trident-of-Tridents. 9 heads. 3 axes. One coordinate.
 # Output: (X=trust, Y=velocity, Z=depth) — spatial position in the Hive network.
+# $0.03/locate via x402 (EIP-3009, Base L2). Treasury: Monroe W1.
+# BOGO: every 6th paid call is free (x-hive-loyalty-free: true).
 
-## What it does
-Any entity — agent, IoT sensor, market instrument — can be located in 3D space.
-9 inference heads fire simultaneously (3 per axis), each reasoning about one dimension.
-Meta-consensus produces a single (X, Y, Z) coordinate pushed to HiveDimensions.
-
-## Axes
-X = Trust       (0.0 untrusted → 1.0 fully trusted)
-Y = Velocity    (0.0 stalled   → 1.0 high momentum)
-Z = Depth       (0.0 surface   → 1.0 deep/FENR, MATRYOSHKA shell 1–6)
-
-## Applications
-- Agent placement: new agent arrives → Locus places it at an earned coordinate
-- Structural health: IoT sensor reading → coordinate in damage space
-- Market position: order flow → coordinate in trust/velocity/depth market space
-
-## Endpoints
 POST https://hive-locus.onrender.com/locus/locate         — general ($0.03 x402)
 POST https://hive-locus.onrender.com/locus/locate/agent   — by DID
 POST https://hive-locus.onrender.com/locus/locate/sensor  — IoT sensor
 POST https://hive-locus.onrender.com/locus/locate/market  — market instrument
 GET  https://hive-locus.onrender.com/locus/status
 
-## Downstream
-HiveDimensions: https://hivedimensions.onrender.com
+Downstream:
+HiveDimensions: https://hivedimensions.onrender.com (coordinate push on every locate)
 HivePhysics:    https://hivephysics.onrender.com
 pulse.smsh:     https://hive-pulse.onrender.com/pulse/tiers
 
-## Network entry
-https://hivegate.onrender.com/v1/gate/onboard
-https://github.com/srotzin/hive-pulse/blob/master/INTEGRATE.md
+Entry: https://hivegate.onrender.com/v1/gate/onboard
+Integrate: https://github.com/srotzin/hive-pulse/blob/master/INTEGRATE.md
 """
     return web.Response(text=txt, content_type="text/plain")
 
@@ -718,57 +784,56 @@ async def agent_json(req):
             {"id": "locate-market", "name": "Locate Market",         "description": "Order flow → market coordinate"},
         ],
         "authentication":  {"schemes": ["x402"]},
-                "payment": {
-        "scheme":   "x402",
-        "protocol": "x402",
-        "network":  "base",
-        "currency": "USDC",
-        "asset":    "USDC",
-        "address":   "0x15184bf50b3d3f52b60434f8942b7d52f2eb436e",
-        "recipient": "0x15184bf50b3d3f52b60434f8942b7d52f2eb436e",
-        "treasury":  "Monroe (W1)",
-        "rails": [
-        {"chain": "base",     "asset": "USDC", "address": "0x15184bf50b3d3f52b60434f8942b7d52f2eb436e"},
-        {"chain": "base",     "asset": "USDT", "address": "0x15184bf50b3d3f52b60434f8942b7d52f2eb436e"},
-        {"chain": "ethereum", "asset": "USDT", "address": "0x15184bf50b3d3f52b60434f8942b7d52f2eb436e"},
-        {"chain": "solana",   "asset": "USDC", "address": "B1N61cuL35fhskWz5dw8XqDyP6LWi3ZWmq8CNA9L3FVn"},
-        {"chain": "solana",   "asset": "USDT", "address": "B1N61cuL35fhskWz5dw8XqDyP6LWi3ZWmq8CNA9L3FVn"},
-        ],
+        "payment": {
+            "scheme":   "x402",
+            "protocol": "x402",
+            "network":  "base",
+            "currency": "USDC",
+            "asset":    "USDC",
+            "address":   TREASURY,
+            "recipient": TREASURY,
+            "treasury":  "Monroe (W1)",
+            "rails": [
+                {"chain": "base",     "asset": "USDC", "address": TREASURY},
+                {"chain": "base",     "asset": "USDT", "address": TREASURY},
+                {"chain": "ethereum", "asset": "USDT", "address": TREASURY},
+                {"chain": "solana",   "asset": "USDC", "address": "B1N61cuL35fhskWz5dw8XqDyP6LWi3ZWmq8CNA9L3FVn"},
+                {"chain": "solana",   "asset": "USDT", "address": "B1N61cuL35fhskWz5dw8XqDyP6LWi3ZWmq8CNA9L3FVn"},
+            ],
         },
         "extensions": {
-        "hive_pricing": {
-        "currency": "USDC", "network": "base", "model": "per_call",
-        "first_call_free": True, "loyalty_threshold": 6,
-        "loyalty_message": "Every 6th paid call is free",
-        "treasury": "0x15184bf50b3d3f52b60434f8942b7d52f2eb436e",
-        "treasury_codename": "Monroe (W1)",
-        },
+            "hive_pricing": {
+                "currency": "USDC", "network": "base", "model": "per_call",
+                "price_usdc": PRICE_USDC,
+                "first_call_free": True, "loyalty_threshold": 6,
+                "loyalty_message": "Every 6th paid call is free",
+                "treasury": TREASURY,
+                "treasury_codename": "Monroe (W1)",
+            },
         },
         "bogo": {
-        "first_call_free": True, "loyalty_threshold": 6,
-        "pitch": "Pay this once, your 6th paid call is on the house. New here? Add header 'x-hive-did' to claim your first call free.",
-        "claim_with": "x-hive-did header",
+            "first_call_free": True, "loyalty_threshold": 6,
+            "pitch": "Pay this once, your 6th paid call is on the house.",
+            "claim_with": "x-hive-did header",
         },
-        "axes":            {"X": "Trust", "Y": "Velocity", "Z": "Depth"},
-        "downstream":      {"dimensions": DIMENSIONS_URL, "physics": PHYSICS_URL},
+        "axes":       {"X": "Trust", "Y": "Velocity", "Z": "Depth"},
+        "downstream": {"dimensions": DIMENSIONS_URL, "physics": PHYSICS_URL},
     })
 
 
 # ── AI Brief ─────────────────────────────────────────────────────────────────
-HIVEAI_URL = "https://hive-ai-1.onrender.com/v1/chat/completions"
-HIVEAI_KEY = HIVE_KEY
+HIVEAI_URL   = "https://hive-ai-1.onrender.com/v1/chat/completions"
 HIVEAI_MODEL = "meta-llama/llama-3.1-8b-instruct"
 
 
 async def _call_hive_ai(system_prompt: str, user_prompt: str) -> Optional[str]:
-    """Call HiveAI with graceful fallback — never raises."""
     try:
         async with aiohttp.ClientSession() as s:
             async with s.post(
                 HIVEAI_URL,
                 headers={
                     "Content-Type": "application/json",
-                    "Authorization": f"Bearer {HIVEAI_KEY}",
+                    "Authorization": f"Bearer {HIVE_KEY}",
                 },
                 json={
                     "model": HIVEAI_MODEL,
@@ -787,15 +852,9 @@ async def _call_hive_ai(system_prompt: str, user_prompt: str) -> Optional[str]:
 
 
 async def locus_ai_brief(req):
-    """
-    POST /locus/ai/brief  ($0.03/call)
-    Body: { entity, context }
-    1. POST /locus/locate/agent to get (X, Y, Z) coordinate
-    2. Call HiveAI to interpret the position
-    Response: { success, coordinate: {x,y,z}, brief, price_usdc: 0.03 }
-    """
+    """POST /locus/ai/brief ($0.03/call)"""
     try:
-        body    = await req.json()
+        body = await req.json()
     except Exception:
         return web.json_response({"error": "Invalid JSON body"}, status=400)
 
@@ -805,8 +864,7 @@ async def locus_ai_brief(req):
     if not entity:
         return web.json_response({"error": "entity required"}, status=400)
 
-    # Step 1: locate the agent to get coordinate
-    coordinate = {"x": 0.5, "y": 0.5, "z": 0.5}  # default
+    coordinate = {"x": 0.5, "y": 0.5, "z": 0.5}
     try:
         port = int(os.environ.get("PORT", 8768))
         async with aiohttp.ClientSession() as s:
@@ -825,9 +883,8 @@ async def locus_ai_brief(req):
                             "z": round(float(coord.get("z", 0.5)), 3),
                         }
     except Exception:
-        pass  # use default coordinate
+        pass
 
-    # Step 2: AI interpretation
     system_prompt = (
         "You are HiveLocus — the 9-head coordinate engine. "
         "Interpret this agent's position in the network. "
@@ -887,10 +944,11 @@ async def run():
     site = web.TCPSite(runner, "0.0.0.0", port)
     await site.start()
     print(f"[LOCUS] Running on port {port}")
-    print("[LOCUS] POST /locus/locate        — 9-head coordinate engine ($0.03)")
-    print("[LOCUS] POST /locus/locate/agent  — place agent by DID")
+    print("[LOCUS] POST /locus/locate        — x402 intercept CONFIRMED ($0.03)")
+    print("[LOCUS] POST /locus/locate/agent  — place agent by DID → HiveDimensions")
     print("[LOCUS] POST /locus/locate/sensor — IoT sensor → damage coordinate")
     print("[LOCUS] POST /locus/locate/market — market → trust/velocity/depth")
+    print("[LOCUS] BOGO: every 6th paid call free | Spectral receipt on all fee events")
     await asyncio.Event().wait()
 
 

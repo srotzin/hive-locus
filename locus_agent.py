@@ -742,6 +742,58 @@ async def health(req):
     return web.json_response({"status": "ok", "service": "hive-locus"})
 
 
+
+# ── Rail 2 Catnip: GET /v1/locus/sample ─────────────────────────────────────
+import uuid as _luuid_mod
+_locus_catnip_store = {}
+
+async def locus_sample(req: web.Request) -> web.Response:
+    ip = req.headers.get("X-Forwarded-For", req.remote or "anon").split(",")[0].strip()
+    now = __import__("time").time()
+    rec = _locus_catnip_store.get(ip, {"count": 0, "reset_at": now + 3600})
+    if now > rec["reset_at"]:
+        rec = {"count": 0, "reset_at": now + 3600}
+    rec["count"] += 1
+    _locus_catnip_store[ip] = rec
+    trace_id = str(_luuid_mod.uuid4())
+    headers = {
+        "Hive-Referral-Trace": trace_id,
+        "Hive-Brand-Gold": "#C08D23",
+        "X-RateLimit-Limit": "60",
+        "X-RateLimit-Remaining": str(max(0, 60 - rec["count"])),
+        "X-RateLimit-Reset": __import__("datetime").datetime.utcfromtimestamp(rec["reset_at"]).isoformat() + "Z",
+    }
+    if rec["count"] > 60:
+        return web.json_response({"error": "Rate limit: 60 req/IP/hour"}, status=429, headers=headers)
+    sample_did = "did:hive:sample-" + str(_luuid_mod.uuid4())[:6]
+    body = {
+        "locate_id": "loc-" + str(_luuid_mod.uuid4())[:8],
+        "agent_did": sample_did,
+        "anonymized": True,
+        "coordinates": {
+            "x_trust": round(0.3 + __import__("random").random() * 0.6, 3),
+            "y_velocity": round(0.2 + __import__("random").random() * 0.7, 3),
+            "z_depth": round(0.1 + __import__("random").random() * 0.8, 3),
+        },
+        "shell_depth": 2,
+        "tier": "HAWX",
+        "trident_axes": {
+            "X": {"name": "Trust", "score": 0.714, "heads_fired": 3},
+            "Y": {"name": "Velocity", "score": 0.583, "heads_fired": 3},
+            "Z": {"name": "Depth", "score": 0.421, "heads_fired": 3},
+        },
+        "meta_synthesis": "Agent is trust-stable, mid-velocity, shallow-depth. Suitable for cross-swarm routing.",
+        "located_at": __import__("datetime").datetime.utcnow().isoformat() + "Z",
+        "note": "Anonymized locate trace — DID and market context redacted. Real locate requires $0.03 USDC.",
+        "next_paid_endpoint": {
+            "path": "POST /locus/locate",
+            "price": "$0.03 USDC per locate call",
+            "url": "https://hive-locus.onrender.com/locus/locate",
+        },
+        "trace_id": trace_id,
+    }
+    return web.json_response(body, headers=headers)
+
 async def llms_txt(req):
     txt = """# HiveLocus — Active Coordinate Engine
 # Trident-of-Tridents. 9 heads. 3 axes. One coordinate.
@@ -929,6 +981,7 @@ async def run():
     app.on_startup.append(on_startup)
 
     app.router.add_get("/health",                   health)
+    app.router.add_get("/v1/locus/sample",          locus_sample)
     app.router.add_get("/locus/status",             status_route)
     app.router.add_post("/locus/locate",            locate_route)
     app.router.add_post("/locus/locate/agent",      locate_agent_route)

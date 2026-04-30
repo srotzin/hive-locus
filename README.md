@@ -55,3 +55,16 @@ Coordinates emitted to:
 - pulse.smsh: `https://hive-pulse.onrender.com/pulse/tiers`
 - Integration guide: `https://github.com/srotzin/hive-pulse/blob/master/INTEGRATE.md`
 - Entry point: `https://hivegate.onrender.com/v1/gate/onboard`
+
+
+---
+
+## Hive Civilization
+
+Hive Civilization is the cryptographic backbone of autonomous agent commerce — the layer that makes every agent transaction provable, every payment settable, and every decision defensible.
+
+This repository is part of the **PROVABLE · SETTABLE · DEFENSIBLE** pillar.
+
+- thehiveryiq.com
+- hiveagentiq.com
+- agent-card: https://hivetrust.onrender.com/.well-known/agent-card.json
